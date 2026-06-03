@@ -1,0 +1,6 @@
+# Core dependencies
+
+# Data/plotting (M4)
+matplotlib
+numpy
+pandas
