@@ -1,8 +1,19 @@
-"""SHA-512 reference implementation (pure Python, no stdlib hashlib).
+"""Modified SHA-512 implementation with key-dependent message schedule.
 
-This module provides a from-scratch, RFC-6234-compliant SHA-512 implementation
-so that the modified variant can be compared at the algorithm level rather than
-just wrapping a black-box.
+The only algorithmic difference from standard SHA-512 is that the message
+schedule expansion (W[16..79]) uses rotation constants derived from a secret
+key rather than the fixed ROTR(1, 8) / ROTR(19, 61) constants specified in
+FIPS 180-4.
+
+All compression-round constants (K₀–K₇₉) and initial hash values remain
+unchanged.
+
+Usage
+-----
+    from src.sha512_modified import sha512_keydep_hash
+
+    digest = sha512_keydep_hash(b"hello", key=b"my-secret-key")
+    print(digest.hexdigest)
 
 Owner: M1
 """
@@ -11,14 +22,19 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import Iterable, List, Optional
+
+from src.key_schedule import (
+    ScheduleConfig,
+    build_schedule_config,
+    derive_schedule_words,
+    iter_message_blocks,
+)
 
 # ---------------------------------------------------------------------------
-# SHA-512 constants (FIPS 180-4)
+# SHA-512 constants (identical to the original)
 # ---------------------------------------------------------------------------
 
-# Initial hash values – first 64 bits of the fractional parts of the
-# square roots of the first 8 primes.
 _H0: List[int] = [
     0x6A09E667F3BCC908, 0xBB67AE8584CAA73B,
     0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
@@ -26,8 +42,6 @@ _H0: List[int] = [
     0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179,
 ]
 
-# Round constants – first 64 bits of the fractional parts of the cube roots
-# of the first 80 primes.
 _K: List[int] = [
     0x428A2F98D728AE22, 0x7137449123EF65CD, 0xB5C0FBCFEC4D3B2F, 0xE9B5DBA58189DBBC,
     0x3956C25BF348B538, 0x59F111F1B605D019, 0x923F82A4AF194F9B, 0xAB1C5ED5DA6D8118,
@@ -52,15 +66,13 @@ _K: List[int] = [
 ]
 
 _MASK64 = 0xFFFFFFFFFFFFFFFF
-_BLOCK_SIZE = 128  # bytes (1024 bits)
 
 
 # ---------------------------------------------------------------------------
-# Bit-operation helpers
+# Internal helpers (unchanged from the standard)
 # ---------------------------------------------------------------------------
 
 def _rotr64(x: int, n: int) -> int:
-    """64-bit right rotation."""
     return ((x >> n) | (x << (64 - n))) & _MASK64
 
 
@@ -73,59 +85,26 @@ def _maj(x: int, y: int, z: int) -> int:
 
 
 def _sigma0_upper(x: int) -> int:
-    """Σ₀ (big sigma 0) – compression function."""
     return _rotr64(x, 28) ^ _rotr64(x, 34) ^ _rotr64(x, 39)
 
 
 def _sigma1_upper(x: int) -> int:
-    """Σ₁ (big sigma 1) – compression function."""
     return _rotr64(x, 14) ^ _rotr64(x, 18) ^ _rotr64(x, 41)
 
 
-def _sigma0_lower(x: int) -> int:
-    """σ₀ (small sigma 0) – message schedule, FIXED constants ROTR(1,8,7)."""
-    return _rotr64(x, 1) ^ _rotr64(x, 8) ^ (x >> 7)
-
-
-def _sigma1_lower(x: int) -> int:
-    """σ₁ (small sigma 1) – message schedule, FIXED constants ROTR(19,61,6)."""
-    return _rotr64(x, 19) ^ _rotr64(x, 61) ^ (x >> 6)
-
-
 # ---------------------------------------------------------------------------
-# Padding
+# Modified compression
 # ---------------------------------------------------------------------------
 
-def _pad_message(message: bytes) -> bytes:
-    """Apply SHA-512 Merkle-Damgård padding."""
-    msg_len_bits = len(message) * 8
-    message += b'\x80'
-    # Pad to 112 bytes mod 128 (leaves 16 bytes for the 128-bit length field)
-    while len(message) % _BLOCK_SIZE != 112:
-        message += b'\x00'
-    # Append 128-bit big-endian length
-    message += struct.pack('>QQ', 0, msg_len_bits)
-    return message
-
-
-# ---------------------------------------------------------------------------
-# Core block compression
-# ---------------------------------------------------------------------------
-
-def _compress(state: List[int], block: bytes) -> List[int]:
-    """Process one 1024-bit block and return updated state."""
-    # Parse 16 × 64-bit words
-    W = list(struct.unpack('>16Q', block))
-
-    # Extend to 80 words using FIXED σ₀ / σ₁
-    for t in range(16, 80):
-        s1 = _sigma1_lower(W[t - 2])
-        s0 = _sigma0_lower(W[t - 15])
-        W.append((s1 + W[t - 7] + s0 + W[t - 16]) & _MASK64)
-
+def _compress_keydep(
+    state: List[int],
+    W: List[int],
+    rounds: int = 80,
+) -> List[int]:
+    """Run the SHA-512 compression function with a pre-expanded schedule W."""
     a, b, c, d, e, f, g, h = state
 
-    for t in range(80):
+    for t in range(rounds):
         T1 = (h + _sigma1_upper(e) + _ch(e, f, g) + _K[t] + W[t]) & _MASK64
         T2 = (_sigma0_upper(a) + _maj(a, b, c)) & _MASK64
         h = g
@@ -148,32 +127,68 @@ def _compress(state: List[int], block: bytes) -> List[int]:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class SHA512Digest:
-    """Result container for SHA-512 digests."""
+class ModifiedSHA512Digest:
+    """Result container for the modified SHA-512 digests."""
 
     hexdigest: str
     digest_bytes: bytes
+    r0: int   # rotation constant used for σ₀
+    r1: int   # rotation constant used for σ₁
 
 
-def sha512_hash(message: bytes) -> SHA512Digest:
-    """Compute the standard SHA-512 digest for the given message.
+def sha512_keydep_hash(
+    message: bytes,
+    key: bytes,
+    rounds: Optional[int] = None,
+) -> ModifiedSHA512Digest:
+    """Compute modified SHA-512 digest using a key-dependent message schedule.
 
-    This is a pure-Python implementation that replicates the FIPS 180-4
-    algorithm with fixed rotation constants in the message schedule (σ₀, σ₁).
+    Parameters
+    ----------
+    message:
+        Arbitrary input message.
+    key:
+        Secret key from which rotation constants are derived.
+    rounds:
+        Number of compression rounds (1–80).  Defaults to 80.  Values < 80
+        are only used for the partial-collision experiments.
+
+    Returns
+    -------
+    ModifiedSHA512Digest
+        Contains the hex digest, raw bytes, and the rotation constants used.
     """
-    padded = _pad_message(message)
+    config = build_schedule_config(key)
+    effective_rounds = rounds if rounds is not None else config.rounds
+
     state = list(_H0)
-    for i in range(0, len(padded), _BLOCK_SIZE):
-        state = _compress(state, padded[i: i + _BLOCK_SIZE])
+    for block in iter_message_blocks(message):
+        W = derive_schedule_words(block, key, config)
+        state = _compress_keydep(state, W, rounds=effective_rounds)
+
     raw = struct.pack('>8Q', *state)
-    return SHA512Digest(hexdigest=raw.hex(), digest_bytes=raw)
+    return ModifiedSHA512Digest(
+        hexdigest=raw.hex(),
+        digest_bytes=raw,
+        r0=config.r0,
+        r1=config.r1,
+    )
 
 
-def hash_stream(chunks: Iterable[bytes]) -> SHA512Digest:
-    """Hash a stream of chunks using standard SHA-512.
+def hash_stream_keydep(
+    chunks: Iterable[bytes],
+    key: bytes,
+    rounds: Optional[int] = None,
+) -> ModifiedSHA512Digest:
+    """Hash a stream of chunks using key-dependent SHA-512.
 
-    Accumulates all chunks before hashing (single-call semantics).  For very
-    large streams a proper incremental implementation would be preferred, but
-    this is sufficient for the experiment sizes in this project.
+    Parameters
+    ----------
+    chunks:
+        Iterable of byte strings; all chunks are concatenated before hashing.
+    key:
+        Secret key.
+    rounds:
+        Optional override for the number of compression rounds.
     """
-    return sha512_hash(b''.join(chunks))
+    return sha512_keydep_hash(b''.join(chunks), key=key, rounds=rounds)

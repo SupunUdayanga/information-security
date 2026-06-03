@@ -1,6 +1,8 @@
 # Core dependencies
 
-# Data/plotting (M4)
-matplotlib
-numpy
-pandas
+# Data processing & plotting
+matplotlib>=3.7.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# No external crypto libraries required — SHA-512 is implemented from scratch.
