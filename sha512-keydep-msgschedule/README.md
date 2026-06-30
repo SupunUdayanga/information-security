@@ -54,7 +54,7 @@ sha512-keydep-msgschedule/
 
 ---
 
-## Getting Started now
+## Getting Started
 
 ### 1. Create a virtual environment
 
@@ -63,7 +63,7 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 ```
 
-### 2. Install dependencies
+### 2. Install dependencies now
 
 ```powershell
 pip install -r requirements.txt
