@@ -54,7 +54,7 @@ sha512-keydep-msgschedule/
 
 ---
 
-## Getting Started like this
+## Getting Started
 
 ### 1. Create a virtual environment
 
